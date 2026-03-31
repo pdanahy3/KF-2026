@@ -96,10 +96,30 @@ def rounded_accuracy(y_true, y_pred):
     return K.mean(K.equal(K.round(y_true), K.round(y_pred)))
 
 
+def _resolve_path(path: str) -> str:
+    """
+    Resolve relative paths against this script's directory (not the current working directory).
+    Absolute paths and paths starting with ~ are preserved/expanded.
+    """
+    path = os.path.expanduser(path)
+    if os.path.isabs(path):
+        return path
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.normpath(os.path.join(base_dir, path))
+
+
 def load_encoder(model_path: str):
     print("Loading model...")
+    resolved_model_path = _resolve_path(model_path)
+    if not os.path.exists(resolved_model_path):
+        raise FileNotFoundError(
+            "Model file not found.\n"
+            f"- provided: {model_path}\n"
+            f"- resolved: {resolved_model_path}\n"
+            "Pass a correct path via --model-path."
+        )
     loaded_model = load_model(
-        model_path,
+        resolved_model_path,
         custom_objects={"rounded_accuracy": rounded_accuracy}
     )
     loaded_model.summary()
@@ -118,6 +138,12 @@ def ensure_output_dir(input_path: str) -> str:
     filedir, _ = os.path.splitext(input_path)
     os.makedirs(filedir, exist_ok=True)
     return filedir
+
+
+def ensure_outputs_folder() -> str:
+    output_dir = _resolve_path("./outputs")
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
 
 
 def preprocess_tile_for_encoder(tile_rgb: np.ndarray) -> np.ndarray:
@@ -980,6 +1006,49 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--model-path", default=MODEL_PATH, help="Keras model path.")
     p.add_argument("--output-name", default=OUTPUT_NAME, help="Output filename (joined under input-derived folder).")
 
+    # Camera input (optional). If enabled, a single frame is captured and used as the input image.
+    p.add_argument(
+        "--use-camera",
+        action="store_true",
+        default=False,
+        help="Use a camera stream as the input instead of --input-path."
+    )
+    p.add_argument(
+        "--camera-index",
+        type=int,
+        default=0,
+        help="OpenCV camera index (0, 1, 2, ...)."
+    )
+    p.add_argument(
+        "--camera-warmup-frames",
+        type=_restricted_int(0, None),
+        default=15,
+        help="Number of frames to discard before capturing."
+    )
+    p.add_argument(
+        "--camera-width",
+        type=_restricted_int(1, None),
+        default=None,
+        help="Optional capture width for the camera stream."
+    )
+    p.add_argument(
+        "--camera-height",
+        type=_restricted_int(1, None),
+        default=None,
+        help="Optional capture height for the camera stream."
+    )
+    p.add_argument(
+        "--camera-display",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Show a preview window; press SPACE/ENTER to capture, ESC to abort."
+    )
+    p.add_argument(
+        "--camera-snapshot-path",
+        default="./outputs/camera_snapshot.png",
+        help="Where to save the captured frame (also used for output folder naming)."
+    )
+
     # Quadtree sliders
     p.add_argument("--threshold", type=float, default=THRESHOLD, help="Subdivision threshold.")
     p.add_argument("--min-cell", type=_restricted_int(1, None), default=MIN_CELL, help="Minimum cell size (pixels).")
@@ -1076,6 +1145,53 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _capture_single_frame_from_camera(
+    camera_index: int,
+    warmup_frames: int = 0,
+    width: int | None = None,
+    height: int | None = None,
+    display: bool = False
+) -> np.ndarray:
+    cap = cv2.VideoCapture(int(camera_index))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera index {camera_index}.")
+
+    if width is not None:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+    if height is not None:
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+
+    try:
+        for _ in range(int(warmup_frames)):
+            cap.read()
+
+        if not display:
+            ok, frame_bgr = cap.read()
+            if not ok or frame_bgr is None:
+                raise RuntimeError("Failed to read a frame from the camera.")
+            return frame_bgr
+
+        last_frame = None
+        while True:
+            ok, frame_bgr = cap.read()
+            if not ok or frame_bgr is None:
+                continue
+            last_frame = frame_bgr
+            cv2.imshow("DST camera (ESC=abort, SPACE/ENTER=capture)", frame_bgr)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:  # ESC
+                raise RuntimeError("Camera capture aborted by user (ESC).")
+            if key in (13, 32):  # ENTER or SPACE
+                return last_frame
+    finally:
+        cap.release()
+        if display:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+
+
 def main(args: argparse.Namespace):
     global IMG_WIDTH, IMG_HEIGHT
     global STYLE_BATCH_SIZE
@@ -1132,12 +1248,29 @@ def main(args: argparse.Namespace):
     encoder = load_encoder(args.model_path)
 
     print("Loading input image...")
-    img_bgr = cv2.imread(args.input_path, cv2.IMREAD_COLOR)
-    if img_bgr is None:
-        raise FileNotFoundError(f"Could not read input image: {args.input_path}")
+    if args.use_camera:
+        snapshot_path = _resolve_path(args.camera_snapshot_path)
+        os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
+
+        img_bgr = _capture_single_frame_from_camera(
+            camera_index=args.camera_index,
+            warmup_frames=args.camera_warmup_frames,
+            width=args.camera_width,
+            height=args.camera_height,
+            display=args.camera_display
+        )
+        ok = cv2.imwrite(snapshot_path, img_bgr)
+        if not ok:
+            raise IOError(f"Failed to write camera snapshot to: {snapshot_path}")
+        effective_input_path = snapshot_path
+        print(f"Captured camera frame to: {snapshot_path}")
+    else:
+        img_bgr = cv2.imread(args.input_path, cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            raise FileNotFoundError(f"Could not read input image: {args.input_path}")
 
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    output_dir = ""
+    output_dir = ensure_outputs_folder()
 
     style_index = StyleIndex(
         encoder_model=encoder,
@@ -1171,7 +1304,7 @@ def main(args: argparse.Namespace):
 
     video_writer = None
     if args.save_substitution_video:
-        video_output_path = os.path.join(output_dir, args.video_name)
+        video_output_path = os.path.join(output_dir, os.path.basename(args.video_name))
         even_img = ensure_even_dimensions(img_rgb)
         video_writer = AsyncVideoWriter(
             output_path=video_output_path,
@@ -1207,7 +1340,7 @@ def main(args: argparse.Namespace):
         if video_writer is not None:
             video_writer.close()
 
-    output_path = os.path.join(output_dir, args.output_name)
+    output_path = os.path.join(output_dir, os.path.basename(args.output_name))
     result_bgr = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
     ok = cv2.imwrite(output_path, result_bgr)
     if not ok:
@@ -1216,7 +1349,7 @@ def main(args: argparse.Namespace):
     print(f"Saved output image to: {output_path}")
 
     if args.save_substitution_video:
-        print(f"Saved animation to: {os.path.join(output_dir, args.video_name)}")
+        print(f"Saved animation to: {os.path.join(output_dir, os.path.basename(args.video_name))}")
 
 
 if __name__ == "__main__":
