@@ -132,6 +132,32 @@ GPU acceleration for ONNX Runtime (CUDA/TensorRT) is environment-specific. If th
 
 ---
 
+## Notes / known issues
+
+### Aspect ratio (camera preview)
+
+- The fullscreen preview should be **aspect-fit** (letterboxed) and never stretched.
+- If you see stretched output, confirm you are using the latest code where preview frames are rendered with an aspect-fit resize (not a direct resize to `--display-width` × `--display-height`).
+
+### CUDA / TensorRT provider loading (Windows)
+
+- Seeing errors like missing `cublasLt64_12.dll` / `cublas64_12.dll` means ONNX Runtime’s CUDA/TensorRT provider DLLs cannot load their CUDA dependencies and will fall back to CPU.
+- Verify provider availability and loading with:
+
+```bash
+python -c "import onnxruntime as ort; print(ort.__version__); print(ort.get_available_providers())"
+```
+
+### Jetson Orin AGX optimization checklist
+
+- Prefer **ONNX + TensorRT** for the encoder (and YOLO) on Jetson.
+- Keep camera capture asynchronous (avoid blocking reads).
+- Process at reduced resolution and **aspect-fit upscale** for display.
+- Avoid per-frame disk writes (`camera_snapshot.png`, debug dumps) in streaming mode.
+- Consider replacing `sklearn` nearest-neighbor with a faster 1-NN implementation (NumPy/Faiss) if NN time dominates.
+
+---
+
 ## Inputs / CLI arguments
 
 All “settings” at the top of `DST.py` are configurable via CLI flags (defaults match the file).

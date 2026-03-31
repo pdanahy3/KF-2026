@@ -7,9 +7,6 @@ from functools import lru_cache
 
 import cv2
 import numpy as np
-import tensorflow as tf
-from keras.models import load_model
-from keras import backend as K
 from sklearn.neighbors import NearestNeighbors
 
 
@@ -44,6 +41,8 @@ def log(msg: str):
 
 
 def rounded_accuracy(y_true, y_pred):
+    # Only used when loading the Keras model backend.
+    from keras import backend as K
     return K.mean(K.equal(K.round(y_true), K.round(y_pred)))
 
 
@@ -53,6 +52,22 @@ def _resolve_path(path: str) -> str:
         return path
     base_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.normpath(os.path.join(base_dir, path))
+
+
+def resize_aspect_fit_bgr(img_bgr: np.ndarray, target_w: int, target_h: int, pad_value: int = 0) -> np.ndarray:
+    h, w = img_bgr.shape[:2]
+    if h <= 0 or w <= 0:
+        raise ValueError(f"Invalid image shape: {img_bgr.shape}")
+    tw, th = int(target_w), int(target_h)
+    scale = min(tw / w, th / h)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    canvas = np.full((th, tw, 3), int(pad_value), dtype=np.uint8)
+    x0 = (tw - new_w) // 2
+    y0 = (th - new_h) // 2
+    canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
+    return canvas
 
 
 def _restricted_float(min_value: float | None = None, max_value: float | None = None):
@@ -120,26 +135,55 @@ def load_encoder(model_path: str):
     resolved = _resolve_path(model_path)
     if not os.path.exists(resolved):
         raise FileNotFoundError(f"Model not found: {resolved}")
+    import tensorflow as tf
     model = load_model(resolved, custom_objects={"rounded_accuracy": rounded_accuracy})
     enc_out = model.layers[-2]
     return tf.keras.models.Model(inputs=model.input, outputs=enc_out.output)
 
 
-def load_onnx_encoder(onnx_path: str):
+def load_onnx_encoder(
+    onnx_path: str,
+    ort_provider: str = "cuda",
+    trt_engine_cache_dir: str = "./checkpoints/trt_cache",
+    trt_fp16: bool = True
+):
     resolved = _resolve_path(onnx_path)
     if not os.path.exists(resolved):
         raise FileNotFoundError(f"ONNX model not found: {resolved}")
     import onnxruntime as ort
-    sess = ort.InferenceSession(resolved, providers=["CPUExecutionProvider"])
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+    providers = []
+    tag = str(ort_provider).lower()
+    if tag in ("auto", "tensorrt", "trt"):
+        cache_dir = _resolve_path(trt_engine_cache_dir)
+        os.makedirs(cache_dir, exist_ok=True)
+        trt_opts = {
+            "trt_engine_cache_enable": True,
+            "trt_engine_cache_path": cache_dir,
+            "trt_fp16_enable": bool(trt_fp16),
+        }
+        providers.append(("TensorrtExecutionProvider", trt_opts))
+        providers.append("CUDAExecutionProvider")
+        providers.append("CPUExecutionProvider")
+    elif tag in ("cuda", "gpu"):
+        providers.append("CUDAExecutionProvider")
+        providers.append("CPUExecutionProvider")
+    else:
+        providers.append("CPUExecutionProvider")
+
+    sess = ort.InferenceSession(resolved, sess_options=so, providers=providers)
     input_name = sess.get_inputs()[0].name
     output_name = sess.get_outputs()[0].name
+    used = sess.get_providers()[0] if sess.get_providers() else "Unknown"
 
     def _forward(x_nhwc_float32: np.ndarray) -> np.ndarray:
         if x_nhwc_float32.dtype != np.float32:
             x_nhwc_float32 = x_nhwc_float32.astype(np.float32)
         return sess.run([output_name], {input_name: x_nhwc_float32})[0]
 
-    return _forward
+    return _forward, used
 
 
 class StyleIndex:
@@ -236,9 +280,17 @@ def _open_camera(camera_index: int, width: int | None, height: int | None) -> cv
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Whole-frame nearest-neighbor style substitution (no subdivision).")
 
-    p.add_argument("--encoder-backend", choices=["keras", "onnx"], default="keras")
+    p.add_argument("--encoder-backend", choices=["keras", "onnx"], default="onnx")
     p.add_argument("--model-path", default=MODEL_PATH, help="Keras .keras path (backend=keras).")
     p.add_argument("--onnx-path", default=ONNX_PATH, help="ONNX encoder path (backend=onnx).")
+    p.add_argument(
+        "--ort-provider",
+        choices=["auto", "tensorrt", "cuda", "cpu"],
+        default="cuda",
+        help="ONNX Runtime execution provider preference (backend=onnx)."
+    )
+    p.add_argument("--trt-engine-cache-dir", default="./checkpoints/trt_cache")
+    p.add_argument("--trt-fp16", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--style-folder", default=STYLE_FOLDER)
 
     p.add_argument("--img-width", type=_restricted_int(1, None), default=IMG_WIDTH)
@@ -287,7 +339,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     p.add_argument("--seed", type=int, default=SEED)
     p.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=VERBOSE)
-    p.add_argument("--tf-xla", action=argparse.BooleanOptionalAction, default=True, help="Enable TF XLA JIT.")
+    p.add_argument("--tf-xla", action=argparse.BooleanOptionalAction, default=True, help="Enable TF XLA JIT (backend=keras).")
     p.add_argument(
         "--profile",
         action=argparse.BooleanOptionalAction,
@@ -306,23 +358,14 @@ def main():
 
     random.seed(args.seed)
     np.random.seed(args.seed)
-    tf.random.set_seed(args.seed)
+    if args.encoder_backend == "keras":
+        import tensorflow as tf
+        tf.random.set_seed(args.seed)
 
     IMG_WIDTH = int(args.img_width)
     IMG_HEIGHT = int(args.img_height)
     STYLE_BATCH_SIZE = int(args.style_batch_size)
     USE_CANNY_PREPROCESS = bool(args.use_canny_preprocess)
-
-    if args.tf_xla:
-        try:
-            tf.config.optimizer.set_jit(True)
-        except Exception:
-            pass
-    try:
-        for gpu in tf.config.list_physical_devices("GPU"):
-            tf.config.experimental.set_memory_growth(gpu, True)
-    except Exception:
-        pass
 
     encoder = None
     encoder_forward_tf = None
@@ -330,6 +373,20 @@ def main():
     encoder_forward_batch = None
 
     if args.encoder_backend == "keras":
+        import tensorflow as tf
+        from keras.models import load_model
+
+        if args.tf_xla:
+            try:
+                tf.config.optimizer.set_jit(True)
+            except Exception:
+                pass
+        try:
+            for gpu in tf.config.list_physical_devices("GPU"):
+                tf.config.experimental.set_memory_growth(gpu, True)
+        except Exception:
+            pass
+
         encoder = load_encoder(args.model_path)
         encoder.trainable = False
 
@@ -344,7 +401,13 @@ def main():
 
         encoder_forward_batch = _forward_batch
     else:
-        encoder_forward_np = load_onnx_encoder(args.onnx_path)
+        encoder_forward_np, used = load_onnx_encoder(
+            args.onnx_path,
+            ort_provider=args.ort_provider,
+            trt_engine_cache_dir=args.trt_engine_cache_dir,
+            trt_fp16=args.trt_fp16,
+        )
+        print(f"ONNX Runtime provider: {used}", flush=True)
         encoder_forward_batch = encoder_forward_np
 
     style_index = StyleIndex(
@@ -375,11 +438,7 @@ def main():
     def get_display_bgr(style_path: str) -> np.ndarray:
         rgb = load_style_rgb(style_path)
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        return cv2.resize(
-            bgr,
-            (int(args.display_width), int(args.display_height)),
-            interpolation=cv2.INTER_AREA
-        )
+        return resize_aspect_fit_bgr(bgr, int(args.display_width), int(args.display_height), pad_value=0)
 
     out_dir = _resolve_path(args.output_dir)
     os.makedirs(out_dir, exist_ok=True)
@@ -400,6 +459,7 @@ def main():
         # Warm up once.
         dummy = np.zeros((1, IMG_HEIGHT, IMG_WIDTH, 3), dtype=np.float32)
         if encoder_forward_tf is not None:
+            import tensorflow as tf
             _ = encoder_forward_tf(tf.convert_to_tensor(dummy))
         else:
             _ = encoder_forward_np(dummy)

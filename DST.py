@@ -198,6 +198,25 @@ def ensure_outputs_folder() -> str:
     return output_dir
 
 
+def resize_aspect_fit_bgr(img_bgr: np.ndarray, target_w: int, target_h: int, pad_value: int = 0) -> np.ndarray:
+    """
+    Resize to fit within (target_w,target_h) while preserving aspect ratio, padding with pad_value.
+    """
+    h, w = img_bgr.shape[:2]
+    if h <= 0 or w <= 0:
+        raise ValueError(f"Invalid image shape: {img_bgr.shape}")
+    tw, th = int(target_w), int(target_h)
+    scale = min(tw / w, th / h)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    canvas = np.full((th, tw, 3), int(pad_value), dtype=np.uint8)
+    x0 = (tw - new_w) // 2
+    y0 = (th - new_h) // 2
+    canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
+    return canvas
+
+
 def _canny_edges_rgb_float01(img_rgb_uint8: np.ndarray, t1: int = 100, t2: int = 200) -> np.ndarray:
     """
     Convert an RGB uint8 image into a 3-channel float32 edge map in [0, 1]
@@ -801,7 +820,7 @@ class TerritorialSubstitutionEngine:
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
         if self.display_target_wh is not None:
             w, h = self.display_target_wh
-            frame_bgr = cv2.resize(frame_bgr, (int(w), int(h)), interpolation=cv2.INTER_NEAREST)
+            frame_bgr = resize_aspect_fit_bgr(frame_bgr, int(w), int(h), pad_value=0)
         cv2.imshow(self.display_window_name, frame_bgr)
         key = cv2.waitKey(1) & 0xFF
         if key == 27:  # ESC
@@ -1187,13 +1206,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--camera-width",
         type=_restricted_int(1, None),
-        default=2160,
+        default=1080,
         help="Optional capture width for the camera stream."
     )
     p.add_argument(
         "--camera-height",
         type=_restricted_int(1, None),
-        default=3840,
+        default=1920,
         help="Optional capture height for the camera stream."
     )
     p.add_argument(
@@ -1202,8 +1221,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
         help="Show a live preview window while substitution runs (ESC to abort)."
     )
-    p.add_argument("--display-width", type=_restricted_int(1, None), default=2160)
-    p.add_argument("--display-height", type=_restricted_int(1, None), default=3840)
+    p.add_argument("--display-width", type=_restricted_int(1, None), default=1080)
+    p.add_argument("--display-height", type=_restricted_int(1, None), default=1920)
     p.add_argument(
         "--process-downscale",
         type=_restricted_int(1, None),
