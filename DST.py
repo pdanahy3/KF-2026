@@ -132,6 +132,57 @@ def load_encoder(model_path: str):
     )
 
 
+def load_onnx_encoder(
+    onnx_path: str,
+    ort_provider: str = "auto",
+    trt_engine_cache_dir: str = "./checkpoints/trt_cache",
+    trt_fp16: bool = True
+):
+    """
+    Returns (encoder_forward(batch_float32_nhwc) -> np.ndarray, provider_name_used)
+    """
+    resolved = _resolve_path(onnx_path)
+    if not os.path.exists(resolved):
+        raise FileNotFoundError(f"ONNX model not found: {resolved}")
+
+    import onnxruntime as ort  # type: ignore
+
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+    providers = []
+    provider_tag = str(ort_provider).lower()
+    if provider_tag in ("auto", "tensorrt", "trt"):
+        cache_dir = _resolve_path(trt_engine_cache_dir)
+        os.makedirs(cache_dir, exist_ok=True)
+        trt_opts = {
+            "trt_engine_cache_enable": True,
+            "trt_engine_cache_path": cache_dir,
+            "trt_fp16_enable": bool(trt_fp16),
+        }
+        providers.append(("TensorrtExecutionProvider", trt_opts))
+        providers.append("CUDAExecutionProvider")
+        providers.append("CPUExecutionProvider")
+    elif provider_tag in ("cuda", "gpu"):
+        providers.append("CUDAExecutionProvider")
+        providers.append("CPUExecutionProvider")
+    else:
+        providers.append("CPUExecutionProvider")
+
+    sess = ort.InferenceSession(resolved, sess_options=so, providers=providers)
+    input_name = sess.get_inputs()[0].name
+    output_name = sess.get_outputs()[0].name
+
+    used = sess.get_providers()[0] if sess.get_providers() else "Unknown"
+
+    def _forward(batch_nhwc_float32: np.ndarray) -> np.ndarray:
+        if batch_nhwc_float32.dtype != np.float32:
+            batch_nhwc_float32 = batch_nhwc_float32.astype(np.float32)
+        return sess.run([output_name], {input_name: batch_nhwc_float32})[0]
+
+    return _forward, used
+
+
 # ============================================================
 # UTILS
 # ============================================================
@@ -309,8 +360,9 @@ class AsyncVideoWriter:
 class StyleIndex:
     def __init__(
         self,
-        encoder_model,
         style_folder: str,
+        encoder_model=None,
+        encoder_forward=None,
         img_width: int = 256,
         img_height: int = 256,
         batch_size: int = 32,
@@ -321,6 +373,7 @@ class StyleIndex:
         min_file_size_bytes: int = 0
     ):
         self.encoder = encoder_model
+        self.encoder_forward = encoder_forward
         self.style_folder = style_folder
         self.img_width = img_width
         self.img_height = img_height
@@ -415,7 +468,10 @@ class StyleIndex:
         for batch_imgs, batch_paths in ds:
             batch_idx += 1
 
-            raw_codes = self.encoder.predict(batch_imgs, verbose=0)
+            if self.encoder_forward is not None:
+                raw_codes = self.encoder_forward(batch_imgs.numpy().astype(np.float32, copy=False))
+            else:
+                raw_codes = self.encoder.predict(batch_imgs, verbose=0)
             batch_codes = encode_to_feature_vectors(
                 raw_codes,
                 use_global_avg_pool=self.use_global_avg_pool
@@ -662,9 +718,10 @@ class TerritorialSubstitutionEngine:
     def __init__(
         self,
         img: np.ndarray,
-        encoder_model,
         style_codes: np.ndarray,
         style_files,
+        encoder_model=None,
+        encoder_forward=None,
         use_global_avg_pool: bool = False,
         style_cache_size: int = 128,
         patch_cache_size: int = 1024,
@@ -684,6 +741,7 @@ class TerritorialSubstitutionEngine:
     ):
         self.img = img
         self.encoder = encoder_model
+        self.encoder_forward = encoder_forward
         self.style_codes = style_codes
         self.style_files = list(style_files)
         self.use_global_avg_pool = use_global_avg_pool
@@ -836,7 +894,10 @@ class TerritorialSubstitutionEngine:
             return 0
 
         batch = np.stack(batch_tiles, axis=0).astype(np.float32)
-        raw_codes = self.encoder.predict(batch, verbose=0)
+        if self.encoder_forward is not None:
+            raw_codes = self.encoder_forward(batch)
+        else:
+            raw_codes = self.encoder.predict(batch, verbose=0)
         codes = encode_to_feature_vectors(
             raw_codes,
             use_global_avg_pool=self.use_global_avg_pool
@@ -1086,6 +1147,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--style-folder", default=STYLE_FOLDER, help="Folder containing style images.")
     p.add_argument("--input-path", default=INPUT_PATH, help="Input image path.")
     p.add_argument("--model-path", default=MODEL_PATH, help="Keras model path.")
+    p.add_argument("--encoder-backend", choices=["keras", "onnx"], default="keras")
+    p.add_argument("--onnx-path", default="./checkpoints/encoder.onnx", help="ONNX encoder path (backend=onnx).")
+    p.add_argument(
+        "--ort-provider",
+        choices=["auto", "tensorrt", "cuda", "cpu"],
+        default="auto",
+        help="ONNX Runtime execution provider preference (backend=onnx)."
+    )
+    p.add_argument("--trt-engine-cache-dir", default="./checkpoints/trt_cache")
+    p.add_argument("--trt-fp16", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--output-name", default=OUTPUT_NAME, help="Output filename (joined under input-derived folder).")
 
     # Camera input (optional). If enabled, a single frame is captured and used as the input image.
@@ -1149,6 +1220,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--camera-snapshot-path",
         default="./outputs/camera_snapshot.png",
         help="Where to save the captured frame (also used for output folder naming)."
+    )
+    p.add_argument(
+        "--save-camera-snapshots",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Save the mirrored camera frame each iteration (debug)."
+    )
+
+    p.add_argument(
+        "--camera-async",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use async camera capture thread to reduce latency."
     )
 
     # Person detection / filtering (camera mode)
@@ -1319,6 +1403,50 @@ def _read_latest_frame_bgr(cap: cv2.VideoCapture, grab_frames: int = 0) -> np.nd
     return frame_bgr
 
 
+class AsyncCamera:
+    def __init__(self, cap: cv2.VideoCapture, grab_frames: int = 0, mirror: bool = True):
+        self.cap = cap
+        self.grab_frames = int(grab_frames)
+        self.mirror = bool(mirror)
+        self._lock = threading.Lock()
+        self._latest = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def _worker(self):
+        while not self._stop.is_set():
+            try:
+                frame = _read_latest_frame_bgr(self.cap, grab_frames=self.grab_frames)
+                if self.mirror:
+                    frame = cv2.flip(frame, 1)
+                with self._lock:
+                    self._latest = frame
+            except Exception:
+                # Avoid tight crash loops; if camera fails temporarily, keep trying.
+                time.sleep(0.01)
+
+    def get_latest(self, wait_ms: int = 500) -> np.ndarray:
+        """
+        Return the most recent frame. If none available yet, wait up to wait_ms.
+        """
+        deadline = time.time() + (max(0, int(wait_ms)) / 1000.0)
+        while True:
+            with self._lock:
+                frame = None if self._latest is None else self._latest.copy()
+            if frame is not None:
+                return frame
+            if time.time() >= deadline:
+                raise RuntimeError("No camera frame available yet.")
+            time.sleep(0.005)
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
 class PersonFilter:
     def __init__(self, model_name: str = "yolov8n.pt", conf: float = 0.25, max_det: int = 5):
         # Lazy import so non-camera workflows don't pay the import cost.
@@ -1427,11 +1555,30 @@ def main(args: argparse.Namespace):
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
 
-    encoder = load_encoder(args.model_path)
+    encoder = None
+    encoder_forward = None
+    if args.encoder_backend == "keras":
+        encoder = load_encoder(args.model_path)
+
+        @tf.function(reduce_retracing=True)
+        def _enc_tf(x: tf.Tensor) -> tf.Tensor:
+            return encoder(x, training=False)
+
+        def encoder_forward(batch_nhwc_float32: np.ndarray) -> np.ndarray:
+            return _enc_tf(tf.convert_to_tensor(batch_nhwc_float32)).numpy()
+    else:
+        encoder_forward, used = load_onnx_encoder(
+            args.onnx_path,
+            ort_provider=args.ort_provider,
+            trt_engine_cache_dir=args.trt_engine_cache_dir,
+            trt_fp16=args.trt_fp16
+        )
+        print(f"ONNX Runtime provider: {used}")
     output_dir = ensure_outputs_folder()
 
     style_index = StyleIndex(
         encoder_model=encoder,
+        encoder_forward=encoder_forward,
         style_folder=args.style_folder,
         img_width=IMG_WIDTH,
         img_height=IMG_HEIGHT,
@@ -1525,7 +1672,8 @@ def main(args: argparse.Namespace):
 
         engine = TerritorialSubstitutionEngine(
             img=img_rgb,
-            encoder_model=encoder,
+        encoder_model=encoder,
+        encoder_forward=encoder_forward,
             style_codes=style_codes,
             style_files=style_files,
             use_global_avg_pool=args.use_global_avg_pool_for_codes,
@@ -1584,15 +1732,31 @@ def main(args: argparse.Namespace):
                     cap.read()
 
                 last_result_rgb = None
+                async_cam = None
+                if args.camera_async:
+                    async_cam = AsyncCamera(
+                        cap=cap,
+                        grab_frames=args.camera_grab_frames,
+                        mirror=True
+                    ).start()
+
                 while True:
                     print("Capturing camera frame...")
-                    img_bgr = _read_latest_frame_bgr(cap, grab_frames=args.camera_grab_frames)
-                    img_bgr = cv2.flip(img_bgr, 1)
+                    if async_cam is not None:
+                        try:
+                            img_bgr = async_cam.get_latest(wait_ms=2000)
+                        except RuntimeError:
+                            time.sleep(0.01)
+                            continue
+                    else:
+                        img_bgr = _read_latest_frame_bgr(cap, grab_frames=args.camera_grab_frames)
+                        img_bgr = cv2.flip(img_bgr, 1)
 
                     # Save snapshot (optional but useful for debugging/repro)
-                    snapshot_path = _resolve_path(args.camera_snapshot_path)
-                    os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
-                    cv2.imwrite(snapshot_path, img_bgr)
+                    if args.save_camera_snapshots:
+                        snapshot_path = _resolve_path(args.camera_snapshot_path)
+                        os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
+                        cv2.imwrite(snapshot_path, img_bgr)
 
                     iteration_tag = time.strftime("%Y%m%d-%H%M%S")
                     last_result_rgb = run_once(
@@ -1601,6 +1765,11 @@ def main(args: argparse.Namespace):
                         initial_output_rgb=last_result_rgb
                     )
             finally:
+                try:
+                    if 'async_cam' in locals() and async_cam is not None:
+                        async_cam.stop()
+                except Exception:
+                    pass
                 cap.release()
         else:
             print("Loading input image...")

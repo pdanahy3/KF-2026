@@ -1,6 +1,10 @@
 ## DST (Agent-based Territorial Style Substitution)
 
-This repository contains `DST.py`, a command-line tool that:
+This repository contains:
+
+- `DST.py`: quadtree + agent-based tile substitution (file input or streaming camera mode)
+- `DST_frame_nn.py`: whole-frame nearest-neighbor style substitution (no subdivision)
+- `scripts/export_onnx.py`: export a `.keras` encoder to ONNX
 
 - Subdivides an input image with a quadtree (splitting high-error regions)
 - Encodes each tile with a neural encoder (from a `.keras` model)
@@ -81,8 +85,50 @@ python DST.py ^
 
 Notes:
 
-- Output is written under a folder derived from the input filename (see `ensure_output_dir()` in `DST.py`).
-- If you want to disable video writing: add `--no-save-substitution-video`.
+- Outputs are written to `./outputs/`.
+- Disable video writing with `--no-save-substitution-video`.
+
+### Streaming camera mode
+
+Runs continuously: capture → subdivide → substitute → repeat. The preview is fullscreen/minimal if `--camera-display` is set.
+
+```bash
+python DST.py --use-camera --camera-display --encoder-backend keras --model-path ".\checkpoints\saved_model.keras"
+```
+
+### Whole-frame nearest neighbor (no subdivision)
+
+This is the lightweight “match the whole frame to one style image” mode:
+
+```bash
+python DST_frame_nn.py --encoder-backend keras --model-path ".\checkpoints\saved_model.keras" --style-folder ".\inputs\Gemini_Generated_Image_am1379am1379am13\quadtree"
+```
+
+Press `ESC` to exit the fullscreen window.
+
+---
+
+## ONNX export + ONNX Runtime (optional)
+
+### Export encoder to ONNX
+
+```bash
+python scripts/export_onnx.py --keras-path ".\checkpoints\saved_model.keras" --onnx-path ".\checkpoints\encoder.onnx"
+```
+
+### Run `DST.py` with ONNX Runtime
+
+```bash
+python DST.py --encoder-backend onnx --onnx-path ".\checkpoints\encoder.onnx" --ort-provider cpu
+```
+
+### Run `DST_frame_nn.py` with ONNX Runtime
+
+```bash
+python DST_frame_nn.py --encoder-backend onnx --onnx-path ".\checkpoints\encoder.onnx"
+```
+
+GPU acceleration for ONNX Runtime (CUDA/TensorRT) is environment-specific. If the GPU providers can’t load, the scripts will fall back to CPU.
 
 ---
 
@@ -93,6 +139,9 @@ All “settings” at the top of `DST.py` are configurable via CLI flags (defaul
 ### Paths / I/O
 
 - **`--model-path`**: Path to `.keras` model. Default: `../checkpoints/saved_model.keras`
+- **`--encoder-backend`**: `keras` or `onnx`
+- **`--onnx-path`**: Path to encoder `.onnx` (when `--encoder-backend onnx`)
+- **`--ort-provider`**: `auto|tensorrt|cuda|cpu` (when `--encoder-backend onnx`)
 - **`--style-folder`**: Folder of style images. Default: `inputs/.../quadtree` (see `DST.py`)
 - **`--input-path`**: Input image path. Default: `inputs/...png` (see `DST.py`)
 - **`--output-name`**: Output image filename (saved under input-derived folder). Default: `../outputs/substitution.jpg`
@@ -165,6 +214,8 @@ The pinned requirements depend on your platform (especially for TensorFlow). Thi
 - `numpy>=1.26,<3`
 - `opencv-python>=4.8`
 - `scikit-learn>=1.3`
+- `onnxruntime>=1.17` (optional for ONNX backend)
+- `onnx>=1.16` and `tf2onnx>=1.16` (optional for exporting ONNX)
 
 If you need strict reproducibility, freeze your environment after install:
 
