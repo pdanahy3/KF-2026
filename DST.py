@@ -4,6 +4,7 @@ import random
 import queue
 import threading
 import argparse
+import time
 from glob import glob
 from functools import lru_cache
 
@@ -634,7 +635,9 @@ class TerritorialSubstitutionEngine:
         write_final_frame_at_end: bool = True,
         agent_population: int = 24,
         agent_neighbor_k: int = 24,
-        agent_shuffle_each_round: bool = True
+        agent_shuffle_each_round: bool = True,
+        display_window_name: str | None = None,
+        display_every_n_substitutions: int = 10
     ):
         self.img = img
         self.encoder = encoder_model
@@ -646,6 +649,9 @@ class TerritorialSubstitutionEngine:
         self.video_writer = video_writer
         self.save_every_n_substitutions = max(1, int(save_every_n_substitutions))
         self.write_final_frame_at_end = write_final_frame_at_end
+
+        self.display_window_name = display_window_name
+        self.display_every_n_substitutions = max(1, int(display_every_n_substitutions))
 
         self.agent_population = max(1, int(agent_population))
         self.agent_neighbor_k = max(2, int(agent_neighbor_k))
@@ -681,6 +687,19 @@ class TerritorialSubstitutionEngine:
         if self.substitution_counter % self.save_every_n_substitutions == 0:
             frame_rgb = ensure_even_dimensions(current_rgb)
             self.video_writer.write(frame_rgb)
+
+    def _maybe_display_frame(self, current_rgb: np.ndarray):
+        if not self.display_window_name:
+            return
+        if self.substitution_counter % self.display_every_n_substitutions != 0:
+            return
+
+        frame_rgb = ensure_even_dimensions(current_rgb)
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        cv2.imshow(self.display_window_name, frame_bgr)
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:  # ESC
+            raise RuntimeError("Aborted (ESC) during live preview.")
 
     def _build_tiles(self, leaves):
         tiles = [TileRecord(i, node) for i, node in enumerate(leaves)]
@@ -805,6 +824,7 @@ class TerritorialSubstitutionEngine:
             substituted += 1
             self.substitution_counter += 1
             self._maybe_write_video_frame(img_out)
+            self._maybe_display_frame(img_out)
 
         return substituted
 
@@ -948,6 +968,12 @@ class TerritorialSubstitutionEngine:
             frame_rgb = ensure_even_dimensions(img_out)
             self.video_writer.write(frame_rgb)
 
+        if self.display_window_name:
+            frame_rgb = ensure_even_dimensions(img_out)
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            cv2.imshow(self.display_window_name, frame_bgr)
+            cv2.waitKey(1)
+
         extra = ""
         if self.save_video and self.video_writer is not None:
             extra = (
@@ -1026,6 +1052,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Number of frames to discard before capturing."
     )
     p.add_argument(
+        "--camera-grab-frames",
+        type=_restricted_int(0, None),
+        default=5,
+        help="Extra frames to grab each iteration before reading the frame."
+    )
+    p.add_argument(
         "--camera-width",
         type=_restricted_int(1, None),
         default=None,
@@ -1041,7 +1073,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--camera-display",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Show a preview window; press SPACE/ENTER to capture, ESC to abort."
+        help="Show a live preview window while substitution runs (ESC to abort)."
+    )
+    p.add_argument(
+        "--display-every-n-substitutions",
+        type=_restricted_int(1, None),
+        default=10,
+        help="When --camera-display is enabled, update the preview window every N substitutions."
     )
     p.add_argument(
         "--camera-snapshot-path",
@@ -1165,31 +1203,43 @@ def _capture_single_frame_from_camera(
         for _ in range(int(warmup_frames)):
             cap.read()
 
-        if not display:
-            ok, frame_bgr = cap.read()
-            if not ok or frame_bgr is None:
-                raise RuntimeError("Failed to read a frame from the camera.")
-            return frame_bgr
-
-        last_frame = None
-        while True:
-            ok, frame_bgr = cap.read()
-            if not ok or frame_bgr is None:
-                continue
-            last_frame = frame_bgr
-            cv2.imshow("DST camera (ESC=abort, SPACE/ENTER=capture)", frame_bgr)
-            key = cv2.waitKey(1) & 0xFF
-            if key == 27:  # ESC
-                raise RuntimeError("Camera capture aborted by user (ESC).")
-            if key in (13, 32):  # ENTER or SPACE
-                return last_frame
+        ok, frame_bgr = cap.read()
+        if not ok or frame_bgr is None:
+            raise RuntimeError("Failed to read a frame from the camera.")
+        return frame_bgr
     finally:
         cap.release()
-        if display:
-            try:
-                cv2.destroyAllWindows()
-            except Exception:
-                pass
+        # Window lifecycle is handled by the caller when using --camera-display.
+
+
+def _open_camera(
+    camera_index: int,
+    width: int | None = None,
+    height: int | None = None
+) -> cv2.VideoCapture:
+    cap = cv2.VideoCapture(int(camera_index))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera index {camera_index}.")
+
+    if width is not None:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+    if height is not None:
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+
+    return cap
+
+
+def _read_latest_frame_bgr(cap: cv2.VideoCapture, grab_frames: int = 0) -> np.ndarray:
+    """
+    Read the most recent frame by grabbing a few frames first.
+    This reduces 'stale frame' latency on some camera backends.
+    """
+    for _ in range(int(grab_frames)):
+        cap.read()
+    ok, frame_bgr = cap.read()
+    if not ok or frame_bgr is None:
+        raise RuntimeError("Failed to read a frame from the camera.")
+    return frame_bgr
 
 
 def main(args: argparse.Namespace):
@@ -1246,30 +1296,6 @@ def main(args: argparse.Namespace):
     tf.random.set_seed(args.seed)
 
     encoder = load_encoder(args.model_path)
-
-    print("Loading input image...")
-    if args.use_camera:
-        snapshot_path = _resolve_path(args.camera_snapshot_path)
-        os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
-
-        img_bgr = _capture_single_frame_from_camera(
-            camera_index=args.camera_index,
-            warmup_frames=args.camera_warmup_frames,
-            width=args.camera_width,
-            height=args.camera_height,
-            display=args.camera_display
-        )
-        ok = cv2.imwrite(snapshot_path, img_bgr)
-        if not ok:
-            raise IOError(f"Failed to write camera snapshot to: {snapshot_path}")
-        effective_input_path = snapshot_path
-        print(f"Captured camera frame to: {snapshot_path}")
-    else:
-        img_bgr = cv2.imread(args.input_path, cv2.IMREAD_COLOR)
-        if img_bgr is None:
-            raise FileNotFoundError(f"Could not read input image: {args.input_path}")
-
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     output_dir = ensure_outputs_folder()
 
     style_index = StyleIndex(
@@ -1289,67 +1315,132 @@ def main(args: argparse.Namespace):
     if len(style_files) == 0:
         raise RuntimeError("No valid style images available.")
 
-    qt = QTree(
-        img=img_rgb,
-        threshold=args.threshold,
-        min_pixel_size=args.min_cell,
-        use_random_split=args.use_random_split,
-        w_randomness=args.w_randomness,
-        h_randomness=args.h_randomness
-    )
-    qt.subdivide()
+    display_window_name = None
+    if args.use_camera and args.camera_display:
+        # Minimal fullscreen preview window (image only).
+        display_window_name = " "
+        cv2.namedWindow(display_window_name, cv2.WINDOW_NORMAL)
+        try:
+            cv2.setWindowProperty(display_window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        except Exception:
+            # Some OpenCV backends may not support fullscreen toggling.
+            pass
 
-    leaves = list(qt.iter_leaves())
-    print(f"Leaf count: {len(leaves)}")
+    def run_once(img_bgr: np.ndarray, iteration_tag: str | None = None) -> np.ndarray:
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-    video_writer = None
-    if args.save_substitution_video:
-        video_output_path = os.path.join(output_dir, os.path.basename(args.video_name))
-        even_img = ensure_even_dimensions(img_rgb)
-        video_writer = AsyncVideoWriter(
-            output_path=video_output_path,
-            frame_size_hw=even_img.shape[:2],
-            fps=args.video_fps,
-            fourcc=args.video_codec_fourcc,
-            queue_maxsize=args.video_queue_maxsize
+        qt = QTree(
+            img=img_rgb,
+            threshold=args.threshold,
+            min_pixel_size=args.min_cell,
+            use_random_split=args.use_random_split,
+            w_randomness=args.w_randomness,
+            h_randomness=args.h_randomness
         )
-        video_writer.start()
+        qt.subdivide()
 
-    engine = TerritorialSubstitutionEngine(
-        img=img_rgb,
-        encoder_model=encoder,
-        style_codes=style_codes,
-        style_files=style_files,
-        use_global_avg_pool=args.use_global_avg_pool_for_codes,
-        style_cache_size=STYLE_CACHE_SIZE,
-        patch_cache_size=PATCH_CACHE_SIZE,
-        nn_algorithm=NN_ALGORITHM,
-        nn_metric=NN_METRIC,
-        save_video=args.save_substitution_video,
-        video_writer=video_writer,
-        save_every_n_substitutions=args.save_every_n_substitutions,
-        write_final_frame_at_end=args.write_final_frame_at_end,
-        agent_population=args.agent_population,
-        agent_neighbor_k=args.agent_neighbor_k,
-        agent_shuffle_each_round=args.agent_shuffle_each_round
-    )
+        leaves = list(qt.iter_leaves())
+        print(f"Leaf count: {len(leaves)}")
+
+        video_writer = None
+        if args.save_substitution_video:
+            base_video_name = os.path.basename(args.video_name)
+            if iteration_tag:
+                root, ext = os.path.splitext(base_video_name)
+                base_video_name = f"{root}_{iteration_tag}{ext or '.mp4'}"
+
+            video_output_path = os.path.join(output_dir, base_video_name)
+            even_img = ensure_even_dimensions(img_rgb)
+            video_writer = AsyncVideoWriter(
+                output_path=video_output_path,
+                frame_size_hw=even_img.shape[:2],
+                fps=args.video_fps,
+                fourcc=args.video_codec_fourcc,
+                queue_maxsize=args.video_queue_maxsize
+            )
+            video_writer.start()
+
+        engine = TerritorialSubstitutionEngine(
+            img=img_rgb,
+            encoder_model=encoder,
+            style_codes=style_codes,
+            style_files=style_files,
+            use_global_avg_pool=args.use_global_avg_pool_for_codes,
+            style_cache_size=STYLE_CACHE_SIZE,
+            patch_cache_size=PATCH_CACHE_SIZE,
+            nn_algorithm=NN_ALGORITHM,
+            nn_metric=NN_METRIC,
+            save_video=args.save_substitution_video,
+            video_writer=video_writer,
+            save_every_n_substitutions=args.save_every_n_substitutions,
+            write_final_frame_at_end=args.write_final_frame_at_end,
+            agent_population=args.agent_population,
+            agent_neighbor_k=args.agent_neighbor_k,
+            agent_shuffle_each_round=args.agent_shuffle_each_round,
+            display_window_name=display_window_name,
+            display_every_n_substitutions=args.display_every_n_substitutions
+        )
+
+        try:
+            result_rgb = engine.run(leaves)
+        finally:
+            if video_writer is not None:
+                video_writer.close()
+
+        base_output_name = os.path.basename(args.output_name)
+        if iteration_tag:
+            root, ext = os.path.splitext(base_output_name)
+            base_output_name = f"{root}_{iteration_tag}{ext or '.jpg'}"
+
+        output_path = os.path.join(output_dir, base_output_name)
+        result_bgr = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
+        ok = cv2.imwrite(output_path, result_bgr)
+        if not ok:
+            raise IOError(f"Failed to save output image to: {output_path}")
+
+        print(f"Saved output image to: {output_path}")
+        return result_rgb
 
     try:
-        result_rgb = engine.run(leaves)
+        if args.use_camera:
+            cap = _open_camera(
+                camera_index=args.camera_index,
+                width=args.camera_width,
+                height=args.camera_height
+            )
+            try:
+                for _ in range(int(args.camera_warmup_frames)):
+                    cap.read()
+
+                while True:
+                    print("Capturing camera frame...")
+                    img_bgr = _read_latest_frame_bgr(cap, grab_frames=args.camera_grab_frames)
+
+                    if display_window_name is not None:
+                        cv2.imshow(display_window_name, img_bgr)
+                        cv2.waitKey(1)
+
+                    # Save snapshot (optional but useful for debugging/repro)
+                    snapshot_path = _resolve_path(args.camera_snapshot_path)
+                    os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
+                    cv2.imwrite(snapshot_path, img_bgr)
+
+                    iteration_tag = time.strftime("%Y%m%d-%H%M%S")
+                    run_once(img_bgr, iteration_tag=iteration_tag)
+            finally:
+                cap.release()
+        else:
+            print("Loading input image...")
+            img_bgr = cv2.imread(args.input_path, cv2.IMREAD_COLOR)
+            if img_bgr is None:
+                raise FileNotFoundError(f"Could not read input image: {args.input_path}")
+            run_once(img_bgr, iteration_tag=None)
     finally:
-        if video_writer is not None:
-            video_writer.close()
-
-    output_path = os.path.join(output_dir, os.path.basename(args.output_name))
-    result_bgr = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
-    ok = cv2.imwrite(output_path, result_bgr)
-    if not ok:
-        raise IOError(f"Failed to save output image to: {output_path}")
-
-    print(f"Saved output image to: {output_path}")
-
-    if args.save_substitution_video:
-        print(f"Saved animation to: {os.path.join(output_dir, os.path.basename(args.video_name))}")
+        if display_window_name is not None:
+            try:
+                cv2.destroyWindow(display_window_name)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
