@@ -65,7 +65,7 @@ WRITE_FINAL_FRAME_AT_END = True
 # ------------------------------------------------------------
 # AGENT SYSTEM
 # ------------------------------------------------------------
-AGENT_POPULATION = 24            # @param {type:"integer"}
+AGENT_POPULATION = 128            # @param {type:"integer"}
 AGENT_NEIGHBOR_K = 24            # @param {type:"integer"}
 AGENT_SHUFFLE_EACH_ROUND = False  # @param {type:"boolean"}
 
@@ -147,10 +147,42 @@ def ensure_outputs_folder() -> str:
     return output_dir
 
 
+def _canny_edges_rgb_float01(img_rgb_uint8: np.ndarray, t1: int = 100, t2: int = 200) -> np.ndarray:
+    """
+    Convert an RGB uint8 image into a 3-channel float32 edge map in [0, 1]
+    using OpenCV Canny on a grayscale conversion.
+    """
+    if img_rgb_uint8.ndim != 3 or img_rgb_uint8.shape[2] != 3:
+        raise ValueError(f"Expected RGB image with shape (H,W,3), got {img_rgb_uint8.shape}")
+    gray = cv2.cvtColor(img_rgb_uint8, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, threshold1=int(t1), threshold2=int(t2))
+    edges_3 = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+    return edges_3.astype(np.float32) / 255.0
+
+
+def _blend_rgb_with_edges_float01(
+    img_rgb_uint8: np.ndarray,
+    edge_t1: int = 100,
+    edge_t2: int = 200,
+    edge_alpha: float = 0.5
+) -> np.ndarray:
+    """
+    Return float32 RGB in [0,1] where Canny edges are overlaid onto the original image:
+      out = (1-alpha)*rgb + alpha*edges
+    """
+    rgb = img_rgb_uint8.astype(np.float32) / 255.0
+    edges = _canny_edges_rgb_float01(img_rgb_uint8, t1=edge_t1, t2=edge_t2)
+    a = float(edge_alpha)
+    if a < 0.0 or a > 1.0:
+        raise ValueError("edge_alpha must be in [0, 1]")
+    return (1.0 - a) * rgb + a * edges
+
+
 def preprocess_tile_for_encoder(tile_rgb: np.ndarray) -> np.ndarray:
     tile_resized = cv2.resize(tile_rgb, (IMG_WIDTH, IMG_HEIGHT), interpolation=cv2.INTER_AREA)
-    tile_float = tile_resized.astype(np.float32) / 255.0
-    return tile_float
+    if tile_resized.dtype != np.uint8:
+        tile_resized = tile_resized.astype(np.uint8, copy=False)
+    return _blend_rgb_with_edges_float01(tile_resized, edge_t1=100, edge_t2=200, edge_alpha=0.5)
 
 
 def encode_to_feature_vectors(codes: np.ndarray, use_global_avg_pool: bool = False) -> np.ndarray:
@@ -348,7 +380,16 @@ class StyleIndex:
         img = tf.image.convert_image_dtype(img, tf.float32)
         img = tf.image.resize(img, [self.img_height, self.img_width], antialias=True)
         img.set_shape((self.img_height, self.img_width, 3))
-        return img, path
+        img_u8 = tf.image.convert_image_dtype(img, tf.uint8, saturate=True)
+
+        def _canny_np(x: np.ndarray) -> np.ndarray:
+            # x is uint8 RGB with shape (H,W,3)
+            blended = _blend_rgb_with_edges_float01(x, edge_t1=100, edge_t2=200, edge_alpha=0.5)
+            return blended.astype(np.float32)
+
+        edges = tf.numpy_function(_canny_np, [img_u8], Tout=tf.float32)
+        edges.set_shape((self.img_height, self.img_width, 3))
+        return edges, path
 
     def _build_dataset(self, files):
         ds = tf.data.Dataset.from_tensor_slices(files)
@@ -637,7 +678,9 @@ class TerritorialSubstitutionEngine:
         agent_neighbor_k: int = 24,
         agent_shuffle_each_round: bool = True,
         display_window_name: str | None = None,
-        display_every_n_substitutions: int = 10
+        display_every_n_substitutions: int = 10,
+        initial_output_rgb: np.ndarray | None = None,
+        display_target_wh: tuple[int, int] | None = None
     ):
         self.img = img
         self.encoder = encoder_model
@@ -652,6 +695,8 @@ class TerritorialSubstitutionEngine:
 
         self.display_window_name = display_window_name
         self.display_every_n_substitutions = max(1, int(display_every_n_substitutions))
+        self.initial_output_rgb = initial_output_rgb
+        self.display_target_wh = display_target_wh
 
         self.agent_population = max(1, int(agent_population))
         self.agent_neighbor_k = max(2, int(agent_neighbor_k))
@@ -696,6 +741,9 @@ class TerritorialSubstitutionEngine:
 
         frame_rgb = ensure_even_dimensions(current_rgb)
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        if self.display_target_wh is not None:
+            w, h = self.display_target_wh
+            frame_bgr = cv2.resize(frame_bgr, (int(w), int(h)), interpolation=cv2.INTER_NEAREST)
         cv2.imshow(self.display_window_name, frame_bgr)
         key = cv2.waitKey(1) & 0xFF
         if key == 27:  # ESC
@@ -830,7 +878,15 @@ class TerritorialSubstitutionEngine:
 
     def run(self, leaves) -> np.ndarray:
         print("Running agent-based territorial substitution...")
-        img_out = self.img.copy()
+        if self.initial_output_rgb is not None:
+            if self.initial_output_rgb.shape != self.img.shape:
+                raise ValueError(
+                    f"initial_output_rgb shape {self.initial_output_rgb.shape} "
+                    f"must match input image shape {self.img.shape}"
+                )
+            img_out = self.initial_output_rgb.copy()
+        else:
+            img_out = self.img.copy()
 
         tiles = self._build_tiles(leaves)
         self._build_neighbor_graph(tiles)
@@ -1060,13 +1116,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--camera-width",
         type=_restricted_int(1, None),
-        default=None,
+        default=2160,
         help="Optional capture width for the camera stream."
     )
     p.add_argument(
         "--camera-height",
         type=_restricted_int(1, None),
-        default=None,
+        default=3840,
         help="Optional capture height for the camera stream."
     )
     p.add_argument(
@@ -1074,6 +1130,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Show a live preview window while substitution runs (ESC to abort)."
+    )
+    p.add_argument("--display-width", type=_restricted_int(1, None), default=2160)
+    p.add_argument("--display-height", type=_restricted_int(1, None), default=3840)
+    p.add_argument(
+        "--process-downscale",
+        type=_restricted_int(1, None),
+        default=2,
+        help="Downscale factor for processing (2 = half resolution). Display remains full resolution."
     )
     p.add_argument(
         "--display-every-n-substitutions",
@@ -1086,6 +1150,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="./outputs/camera_snapshot.png",
         help="Where to save the captured frame (also used for output folder naming)."
     )
+
+    # Person detection / filtering (camera mode)
+    p.add_argument(
+        "--use-person-filter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable YOLO person detection and apply spotlight filter before substitution."
+    )
+    p.add_argument("--yolo-model", default="yolov8n.pt", help="Ultralytics YOLO model name/path.")
+    p.add_argument("--person-conf", type=_restricted_float(0.0, 1.0), default=0.25)
+    p.add_argument("--person-max-det", type=_restricted_int(1, None), default=5)
+    p.add_argument("--person-bg-scale", type=_restricted_float(0.0, 1.0), default=0.4)
+    p.add_argument("--person-fg-scale", type=_restricted_float(0.0, 5.0), default=1.2)
 
     # Quadtree sliders
     p.add_argument("--threshold", type=float, default=THRESHOLD, help="Subdivision threshold.")
@@ -1242,6 +1319,61 @@ def _read_latest_frame_bgr(cap: cv2.VideoCapture, grab_frames: int = 0) -> np.nd
     return frame_bgr
 
 
+class PersonFilter:
+    def __init__(self, model_name: str = "yolov8n.pt", conf: float = 0.25, max_det: int = 5):
+        # Lazy import so non-camera workflows don't pay the import cost.
+        from ultralytics import YOLO  # type: ignore
+        self.model = YOLO(model_name)
+        self.conf = float(conf)
+        self.max_det = int(max_det)
+
+    def person_boxes_xyxy(self, img_bgr: np.ndarray) -> np.ndarray:
+        """
+        Returns Nx4 float array of xyxy boxes for class=person.
+        """
+        results = self.model.predict(
+            source=img_bgr,
+            classes=[0],  # person
+            conf=self.conf,
+            max_det=self.max_det,
+            verbose=False
+        )
+        if not results:
+            return np.zeros((0, 4), dtype=np.float32)
+        r0 = results[0]
+        if r0.boxes is None or r0.boxes.xyxy is None:
+            return np.zeros((0, 4), dtype=np.float32)
+        return r0.boxes.xyxy.cpu().numpy().astype(np.float32, copy=False)
+
+
+def apply_person_spotlight_filter_bgr(
+    img_bgr: np.ndarray,
+    boxes_xyxy: np.ndarray,
+    bg_scale: float = 0.4,
+    fg_scale: float = 1.2
+) -> np.ndarray:
+    """
+    Darken background and lighten detected person regions (rectangular boxes).
+    Output is uint8 BGR.
+    """
+    out = img_bgr.astype(np.float32).copy()
+    out *= float(bg_scale)
+
+    h, w = img_bgr.shape[:2]
+    for x1, y1, x2, y2 in boxes_xyxy:
+        x1i = max(0, min(w - 1, int(x1)))
+        y1i = max(0, min(h - 1, int(y1)))
+        x2i = max(0, min(w, int(x2)))
+        y2i = max(0, min(h, int(y2)))
+        if x2i <= x1i or y2i <= y1i:
+            continue
+        roi = img_bgr[y1i:y2i, x1i:x2i].astype(np.float32)
+        roi *= float(fg_scale)
+        out[y1i:y2i, x1i:x2i] = roi
+
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 def main(args: argparse.Namespace):
     global IMG_WIDTH, IMG_HEIGHT
     global STYLE_BATCH_SIZE
@@ -1326,11 +1458,33 @@ def main(args: argparse.Namespace):
             # Some OpenCV backends may not support fullscreen toggling.
             pass
 
-    def run_once(img_bgr: np.ndarray, iteration_tag: str | None = None) -> np.ndarray:
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    person_filter = None
+    if args.use_camera and args.use_person_filter:
+        print("Loading YOLO person detector...")
+        person_filter = PersonFilter(
+            model_name=args.yolo_model,
+            conf=args.person_conf,
+            max_det=args.person_max_det
+        )
+
+    def run_once(
+        img_bgr: np.ndarray,
+        iteration_tag: str | None = None,
+        initial_output_rgb: np.ndarray | None = None
+    ) -> np.ndarray:
+        # Preserve full-resolution frame, process at downscaled resolution
+        ds = int(args.process_downscale)
+        if ds < 1:
+            ds = 1
+
+        full_h, full_w = img_bgr.shape[:2]
+        proc_w = max(2, (full_w // ds) // 2 * 2)
+        proc_h = max(2, (full_h // ds) // 2 * 2)
+        img_bgr_proc = cv2.resize(img_bgr, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
+        img_rgb_unfiltered = cv2.cvtColor(img_bgr_proc, cv2.COLOR_BGR2RGB)
 
         qt = QTree(
-            img=img_rgb,
+            img=img_rgb_unfiltered,
             threshold=args.threshold,
             min_pixel_size=args.min_cell,
             use_random_split=args.use_random_split,
@@ -1341,6 +1495,15 @@ def main(args: argparse.Namespace):
 
         leaves = list(qt.iter_leaves())
         print(f"Leaf count: {len(leaves)}")
+
+        # Filter the capture AFTER subdivision, BEFORE substitution/matching.
+        img_bgr_for_sub = img_bgr_proc
+        if person_filter is not None:
+            boxes = person_filter.person_boxes_xyxy(img_bgr_proc)
+            if boxes.shape[0] > 0:
+                img_bgr_for_sub = 255 - img_bgr_proc
+
+        img_rgb = cv2.cvtColor(img_bgr_for_sub, cv2.COLOR_BGR2RGB)
 
         video_writer = None
         if args.save_substitution_video:
@@ -1378,7 +1541,9 @@ def main(args: argparse.Namespace):
             agent_neighbor_k=args.agent_neighbor_k,
             agent_shuffle_each_round=args.agent_shuffle_each_round,
             display_window_name=display_window_name,
-            display_every_n_substitutions=args.display_every_n_substitutions
+            display_every_n_substitutions=args.display_every_n_substitutions,
+            initial_output_rgb=initial_output_rgb,
+            display_target_wh=(int(args.display_width), int(args.display_height)) if display_window_name else None
         )
 
         try:
@@ -1393,7 +1558,13 @@ def main(args: argparse.Namespace):
             base_output_name = f"{root}_{iteration_tag}{ext or '.jpg'}"
 
         output_path = os.path.join(output_dir, base_output_name)
+        # Save at full display resolution (upsampled from processing resolution)
         result_bgr = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
+        result_bgr = cv2.resize(
+            result_bgr,
+            (int(args.display_width), int(args.display_height)),
+            interpolation=cv2.INTER_NEAREST
+        )
         ok = cv2.imwrite(output_path, result_bgr)
         if not ok:
             raise IOError(f"Failed to save output image to: {output_path}")
@@ -1412,13 +1583,11 @@ def main(args: argparse.Namespace):
                 for _ in range(int(args.camera_warmup_frames)):
                     cap.read()
 
+                last_result_rgb = None
                 while True:
                     print("Capturing camera frame...")
                     img_bgr = _read_latest_frame_bgr(cap, grab_frames=args.camera_grab_frames)
-
-                    if display_window_name is not None:
-                        cv2.imshow(display_window_name, img_bgr)
-                        cv2.waitKey(1)
+                    img_bgr = cv2.flip(img_bgr, 1)
 
                     # Save snapshot (optional but useful for debugging/repro)
                     snapshot_path = _resolve_path(args.camera_snapshot_path)
@@ -1426,7 +1595,11 @@ def main(args: argparse.Namespace):
                     cv2.imwrite(snapshot_path, img_bgr)
 
                     iteration_tag = time.strftime("%Y%m%d-%H%M%S")
-                    run_once(img_bgr, iteration_tag=iteration_tag)
+                    last_result_rgb = run_once(
+                        img_bgr,
+                        iteration_tag=iteration_tag,
+                        initial_output_rgb=last_result_rgb
+                    )
             finally:
                 cap.release()
         else:
